@@ -403,9 +403,312 @@ const SubagentParams = Type.Object({
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+	background: Type.Optional(
+		Type.Boolean({
+			description:
+				"Run in background. Returns immediately with a job ID. Use subagent_jobs tool to check status and retrieve results.",
+			default: false,
+		}),
+	),
 });
 
+// --- Background job management ---
+
+type JobStatus = "running" | "completed" | "failed";
+
+interface BackgroundJob {
+	id: string;
+	status: JobStatus;
+	agent: string;
+	task: string;
+	mode: "single" | "parallel" | "chain";
+	startedAt: number;
+	finishedAt?: number;
+	result?: {
+		content: Array<{ type: "text"; text: string }>;
+		details: SubagentDetails;
+		isError?: boolean;
+	};
+}
+
+let jobCounter = 0;
+const backgroundJobs = new Map<string, BackgroundJob>();
+
+function generateJobId(): string {
+	return `job-${++jobCounter}`;
+}
+
+function getRunningJobCount(): number {
+	let count = 0;
+	for (const job of backgroundJobs.values()) {
+		if (job.status === "running") count++;
+	}
+	return count;
+}
+
+function formatJobSummary(job: BackgroundJob): string {
+	const elapsed = ((job.finishedAt ?? Date.now()) - job.startedAt) / 1000;
+	const icon = job.status === "running" ? "⏳" : job.status === "completed" ? "✓" : "✗";
+	return `${icon} ${job.id} [${job.mode}] ${job.agent}: ${job.task.slice(0, 60)}${job.task.length > 60 ? "..." : ""} (${job.status}, ${elapsed.toFixed(1)}s)`;
+}
+
+// Extracted foreground execution logic so it can be reused by background mode
+async function runForegroundExecution(
+	params: any,
+	cwd: string,
+	agents: AgentConfig[],
+	agentScope: AgentScope,
+	discovery: { projectAgentsDir: string | null },
+	makeDetails: (mode: "single" | "parallel" | "chain") => (results: SingleResult[]) => SubagentDetails,
+	signal?: AbortSignal,
+	onUpdate?: OnUpdateCallback,
+): Promise<{ content: Array<{ type: string; text: string }>; details: SubagentDetails; isError?: boolean }> {
+	if (params.chain && params.chain.length > 0) {
+		const results: SingleResult[] = [];
+		let previousOutput = "";
+
+		for (let i = 0; i < params.chain.length; i++) {
+			const step = params.chain[i];
+			const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+
+			const chainUpdate: OnUpdateCallback | undefined = onUpdate
+				? (partial) => {
+						const currentResult = partial.details?.results[0];
+						if (currentResult) {
+							const allResults = [...results, currentResult];
+							onUpdate({
+								content: partial.content,
+								details: makeDetails("chain")(allResults),
+							});
+						}
+					}
+				: undefined;
+
+			const result = await runSingleAgent(
+				cwd, agents, step.agent, taskWithContext, step.cwd, i + 1,
+				signal, chainUpdate, makeDetails("chain"),
+			);
+			results.push(result);
+
+			const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+			if (isError) {
+				const errorMsg = result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+				return {
+					content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
+					details: makeDetails("chain")(results),
+					isError: true,
+				};
+			}
+			previousOutput = getFinalOutput(result.messages);
+		}
+		return {
+			content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
+			details: makeDetails("chain")(results),
+		};
+	}
+
+	if (params.tasks && params.tasks.length > 0) {
+		if (params.tasks.length > MAX_PARALLEL_TASKS)
+			return {
+				content: [{ type: "text", text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.` }],
+				details: makeDetails("parallel")([]),
+			};
+
+		const allResults: SingleResult[] = new Array(params.tasks.length);
+		for (let i = 0; i < params.tasks.length; i++) {
+			allResults[i] = {
+				agent: params.tasks[i].agent, agentSource: "unknown", task: params.tasks[i].task,
+				exitCode: -1, messages: [], stderr: "",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			};
+		}
+
+		const emitParallelUpdate = () => {
+			if (onUpdate) {
+				const running = allResults.filter((r) => r.exitCode === -1).length;
+				const done = allResults.filter((r) => r.exitCode !== -1).length;
+				onUpdate({
+					content: [{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` }],
+					details: makeDetails("parallel")([...allResults]),
+				});
+			}
+		};
+
+		const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t: any, index: number) => {
+			const result = await runSingleAgent(
+				cwd, agents, t.agent, t.task, t.cwd, undefined, signal,
+				(partial) => {
+					if (partial.details?.results[0]) {
+						allResults[index] = partial.details.results[0];
+						emitParallelUpdate();
+					}
+				},
+				makeDetails("parallel"),
+			);
+			allResults[index] = result;
+			emitParallelUpdate();
+			return result;
+		});
+
+		const successCount = results.filter((r) => r.exitCode === 0).length;
+		const summaries = results.map((r) => {
+			const output = getFinalOutput(r.messages);
+			const preview = output.slice(0, 100) + (output.length > 100 ? "..." : "");
+			return `[${r.agent}] ${r.exitCode === 0 ? "completed" : "failed"}: ${preview || "(no output)"}`;
+		});
+		return {
+			content: [{ type: "text", text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n")}` }],
+			details: makeDetails("parallel")(results),
+		};
+	}
+
+	if (params.agent && params.task) {
+		const result = await runSingleAgent(
+			cwd, agents, params.agent, params.task, params.cwd, undefined, signal, onUpdate, makeDetails("single"),
+		);
+		const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+		if (isError) {
+			const errorMsg = result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+			return {
+				content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
+				details: makeDetails("single")([result]),
+				isError: true,
+			};
+		}
+		return {
+			content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
+			details: makeDetails("single")([result]),
+		};
+	}
+
+	const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
+	return {
+		content: [{ type: "text", text: `Invalid parameters. Available agents: ${available}` }],
+		details: makeDetails("single")([]),
+	};
+}
+
 export default function (pi: ExtensionAPI) {
+	// --- Widget: show background job count ---
+	function updateWidget(ctx?: { ui: { setWidget: (id: string, lines: string[] | undefined) => void } }) {
+		const running = getRunningJobCount();
+		if (running > 0 && ctx) {
+			ctx.ui.setWidget("subagent-jobs", [`⏳ ${running} background job${running > 1 ? "s" : ""} running`]);
+		} else if (ctx) {
+			ctx.ui.setWidget("subagent-jobs", undefined);
+		}
+	}
+
+	// Store ctx reference for background job completion notifications
+	let latestCtx: any = null;
+
+	pi.on("agent_start", async (_event, ctx) => {
+		latestCtx = ctx;
+		updateWidget(ctx);
+	});
+
+	// --- /jobs command ---
+	pi.registerCommand("jobs", {
+		description: "List background subagent jobs",
+		handler: async (_args, ctx) => {
+			if (backgroundJobs.size === 0) {
+				ctx.ui.notify("No background jobs.", "info");
+				return;
+			}
+			const lines: string[] = [];
+			for (const job of backgroundJobs.values()) {
+				lines.push(formatJobSummary(job));
+			}
+			ctx.ui.notify(lines.join("\n"), "info");
+		},
+	});
+
+	// --- subagent_jobs tool: LLM can query background job results ---
+	pi.registerTool({
+		name: "subagent_jobs",
+		label: "Subagent Jobs",
+		description: [
+			"Query background subagent jobs.",
+			"Actions: list (show all jobs), get (retrieve result by job ID), clear (remove finished jobs).",
+		].join(" "),
+		parameters: Type.Object({
+			action: StringEnum(["list", "get", "clear"] as const, {
+				description: "Action to perform",
+			}),
+			jobId: Type.Optional(Type.String({ description: 'Job ID to retrieve (for "get" action)' })),
+		}),
+
+		async execute(_toolCallId, params) {
+			if (params.action === "list") {
+				if (backgroundJobs.size === 0) {
+					return { content: [{ type: "text", text: "No background jobs." }] };
+				}
+				const lines: string[] = [];
+				for (const job of backgroundJobs.values()) {
+					lines.push(formatJobSummary(job));
+				}
+				return { content: [{ type: "text", text: lines.join("\n") }] };
+			}
+
+			if (params.action === "get") {
+				if (!params.jobId) {
+					return { content: [{ type: "text", text: "Missing jobId parameter." }], isError: true };
+				}
+				const job = backgroundJobs.get(params.jobId);
+				if (!job) {
+					return {
+						content: [{ type: "text", text: `Job not found: ${params.jobId}` }],
+						isError: true,
+					};
+				}
+				if (job.status === "running") {
+					const elapsed = ((Date.now() - job.startedAt) / 1000).toFixed(1);
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Job ${job.id} is still running (${elapsed}s elapsed). Agent: ${job.agent}, Task: ${job.task}`,
+							},
+						],
+					};
+				}
+				if (job.result) {
+					return {
+						content: job.result.content,
+						details: job.result.details,
+						isError: job.result.isError,
+					};
+				}
+				return { content: [{ type: "text", text: `Job ${job.id}: ${job.status} (no result data)` }] };
+			}
+
+			if (params.action === "clear") {
+				let cleared = 0;
+				for (const [id, job] of backgroundJobs.entries()) {
+					if (job.status !== "running") {
+						backgroundJobs.delete(id);
+						cleared++;
+					}
+				}
+				return { content: [{ type: "text", text: `Cleared ${cleared} finished job(s).` }] };
+			}
+
+			return { content: [{ type: "text", text: `Unknown action: ${params.action}` }], isError: true };
+		},
+
+		renderCall(args, theme) {
+			let text = theme.fg("toolTitle", theme.bold("subagent_jobs ")) + theme.fg("accent", args.action || "?");
+			if (args.jobId) text += theme.fg("dim", ` ${args.jobId}`);
+			return new Text(text, 0, 0);
+		},
+
+		renderResult(result, _options, theme) {
+			const text = result.content[0];
+			return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+		},
+	});
+
+	// --- Main subagent tool ---
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
@@ -414,6 +717,7 @@ export default function (pi: ExtensionAPI) {
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
 			'Default agent scope is "user" (from ~/.pi/agent/agents).',
 			'To enable project-local agents in .pi/agents, set agentScope: "both" (or "project").',
+			"Set background: true to run in background and continue chatting. Use subagent_jobs tool to check results.",
 		].join(" "),
 		parameters: SubagentParams,
 
@@ -475,184 +779,84 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			if (params.chain && params.chain.length > 0) {
-				const results: SingleResult[] = [];
-				let previousOutput = "";
+			// --- Background mode: dispatch and return immediately ---
+			if (params.background) {
+				const jobId = generateJobId();
+				const mode = hasChain ? "chain" : hasTasks ? "parallel" : "single";
+				const agentName = params.agent || (params.chain?.[0]?.agent) || (params.tasks?.[0]?.agent) || "unknown";
+				const taskDesc = params.task || (params.chain?.[0]?.task) || (params.tasks?.map((t) => t.agent).join(", ")) || "unknown";
 
-				for (let i = 0; i < params.chain.length; i++) {
-					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+				const job: BackgroundJob = {
+					id: jobId,
+					status: "running",
+					agent: agentName,
+					task: taskDesc,
+					mode,
+					startedAt: Date.now(),
+				};
+				backgroundJobs.set(jobId, job);
+				updateWidget(ctx);
 
-					// Create update callback that includes all previous results
-					const chainUpdate: OnUpdateCallback | undefined = onUpdate
-						? (partial) => {
-								// Combine completed results with current streaming result
-								const currentResult = partial.details?.results[0];
-								if (currentResult) {
-									const allResults = [...results, currentResult];
-									onUpdate({
-										content: partial.content,
-										details: makeDetails("chain")(allResults),
-									});
-								}
-							}
-						: undefined;
+				// Clone params without background flag, run asynchronously
+				const fgParams = { ...params, background: false };
+				const capturedCwd = ctx.cwd;
 
-					const result = await runSingleAgent(
-						ctx.cwd,
-						agents,
-						step.agent,
-						taskWithContext,
-						step.cwd,
-						i + 1,
-						signal,
-						chainUpdate,
-						makeDetails("chain"),
-					);
-					results.push(result);
-
-					const isError =
-						result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
-					if (isError) {
-						const errorMsg =
-							result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
-						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
-							details: makeDetails("chain")(results),
+				// Fire and forget — run the same execute logic in background
+				(async () => {
+					try {
+						const bgResult = await runForegroundExecution(
+							fgParams, capturedCwd, agents, agentScope, discovery, makeDetails,
+						);
+						job.status = bgResult.isError ? "failed" : "completed";
+						job.finishedAt = Date.now();
+						job.result = {
+							content: bgResult.content as Array<{ type: "text"; text: string }>,
+							details: bgResult.details as SubagentDetails,
+							isError: bgResult.isError,
+						};
+					} catch (err: any) {
+						job.status = "failed";
+						job.finishedAt = Date.now();
+						job.result = {
+							content: [{ type: "text", text: `Background job error: ${err?.message ?? err}` }],
+							details: makeDetails(mode)([]),
 							isError: true,
 						};
 					}
-					previousOutput = getFinalOutput(result.messages);
-				}
-				return {
-					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
-					details: makeDetails("chain")(results),
-				};
-			}
-
-			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS)
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
-							},
-						],
-						details: makeDetails("parallel")([]),
-					};
-
-				// Track all results for streaming updates
-				const allResults: SingleResult[] = new Array(params.tasks.length);
-
-				// Initialize placeholder results
-				for (let i = 0; i < params.tasks.length; i++) {
-					allResults[i] = {
-						agent: params.tasks[i].agent,
-						agentSource: "unknown",
-						task: params.tasks[i].task,
-						exitCode: -1, // -1 = still running
-						messages: [],
-						stderr: "",
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-					};
-				}
-
-				const emitParallelUpdate = () => {
-					if (onUpdate) {
-						const running = allResults.filter((r) => r.exitCode === -1).length;
-						const done = allResults.filter((r) => r.exitCode !== -1).length;
-						onUpdate({
-							content: [
-								{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` },
-							],
-							details: makeDetails("parallel")([...allResults]),
-						});
+					updateWidget(latestCtx);
+					// Notify user
+					const elapsed = ((job.finishedAt! - job.startedAt) / 1000).toFixed(1);
+					const icon = job.status === "completed" ? "✓" : "✗";
+					if (latestCtx?.ui?.notify) {
+						latestCtx.ui.notify(
+							`${icon} Background job ${jobId} ${job.status} (${elapsed}s)\nAgent: ${job.agent}\nUse subagent_jobs tool with action "get" and jobId "${jobId}" to see results.`,
+							job.status === "completed" ? "info" : "error",
+						);
 					}
-				};
+				})();
 
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
-					const result = await runSingleAgent(
-						ctx.cwd,
-						agents,
-						t.agent,
-						t.task,
-						t.cwd,
-						undefined,
-						signal,
-						// Per-task update callback
-						(partial) => {
-							if (partial.details?.results[0]) {
-								allResults[index] = partial.details.results[0];
-								emitParallelUpdate();
-							}
-						},
-						makeDetails("parallel"),
-					);
-					allResults[index] = result;
-					emitParallelUpdate();
-					return result;
-				});
-
-				const successCount = results.filter((r) => r.exitCode === 0).length;
-				const summaries = results.map((r) => {
-					const output = getFinalOutput(r.messages);
-					const preview = output.slice(0, 100) + (output.length > 100 ? "..." : "");
-					return `[${r.agent}] ${r.exitCode === 0 ? "completed" : "failed"}: ${preview || "(no output)"}`;
-				});
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n")}`,
+							text: `Background job started: ${jobId}\nAgent: ${agentName}, Mode: ${mode}\nUse subagent_jobs tool with action "get" and jobId "${jobId}" to check results later.`,
 						},
 					],
-					details: makeDetails("parallel")(results),
+					details: makeDetails(mode)([]),
 				};
 			}
 
-			if (params.agent && params.task) {
-				const result = await runSingleAgent(
-					ctx.cwd,
-					agents,
-					params.agent,
-					params.task,
-					params.cwd,
-					undefined,
-					signal,
-					onUpdate,
-					makeDetails("single"),
-				);
-				const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
-				if (isError) {
-					const errorMsg =
-						result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
-					return {
-						content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
-						details: makeDetails("single")([result]),
-						isError: true,
-					};
-				}
-				return {
-					content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
-					details: makeDetails("single")([result]),
-				};
-			}
-
-			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
-			return {
-				content: [{ type: "text", text: `Invalid parameters. Available agents: ${available}` }],
-				details: makeDetails("single")([]),
-			};
+			return runForegroundExecution(params, ctx.cwd, agents, agentScope, discovery, makeDetails, signal, onUpdate);
 		},
 
 		renderCall(args, theme) {
 			const scope: AgentScope = args.agentScope ?? "user";
+			const bgTag = args.background ? theme.fg("warning", " [bg]") : "";
 			if (args.chain && args.chain.length > 0) {
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +
 					theme.fg("accent", `chain (${args.chain.length} steps)`) +
-					theme.fg("muted", ` [${scope}]`);
+					theme.fg("muted", ` [${scope}]`) + bgTag;
 				for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
 					const step = args.chain[i];
 					// Clean up {previous} placeholder for display
@@ -672,7 +876,7 @@ export default function (pi: ExtensionAPI) {
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +
 					theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
-					theme.fg("muted", ` [${scope}]`);
+					theme.fg("muted", ` [${scope}]`) + bgTag;
 				for (const t of args.tasks.slice(0, 3)) {
 					const preview = t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task;
 					text += `\n  ${theme.fg("accent", t.agent)}${theme.fg("dim", ` ${preview}`)}`;
@@ -685,7 +889,7 @@ export default function (pi: ExtensionAPI) {
 			let text =
 				theme.fg("toolTitle", theme.bold("subagent ")) +
 				theme.fg("accent", agentName) +
-				theme.fg("muted", ` [${scope}]`);
+				theme.fg("muted", ` [${scope}]`) + bgTag;
 			text += `\n  ${theme.fg("dim", preview)}`;
 			return new Text(text, 0, 0);
 		},

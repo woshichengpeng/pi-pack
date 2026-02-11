@@ -78,6 +78,28 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 | Parallel | `{ tasks: [...] }` | Multiple agents run concurrently (max 8, 4 concurrent) |
 | Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder |
 
+## Background Mode
+
+Add `background: true` to any subagent call to run it without blocking the conversation:
+
+```
+Run subagent in background with agent "worker" to refactor the auth module
+```
+
+- Returns immediately with a **job ID**
+- Widget shows running job count (⏳)
+- Notification when job completes
+- Use `subagent_jobs` tool (or `/jobs` command) to check status and retrieve results
+
+### Checking Results
+
+The LLM can query jobs via the `subagent_jobs` tool:
+- `{ action: "list" }` — list all jobs
+- `{ action: "get", jobId: "job-1" }` — get result of a specific job
+- `{ action: "clear" }` — remove finished jobs
+
+Or use `/jobs` to see a quick summary interactively.
+
 ## Output Display
 
 **Collapsed view** (default):
