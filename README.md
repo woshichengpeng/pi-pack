@@ -1,6 +1,6 @@
 # pi-pack
 
-Personal collection of [pi](https://github.com/badlogic/pi) extensions, skills, agents, and themes.
+Personal collection of [pi](https://github.com/badlogic/pi) extensions, skills, prompts, agents, and themes.
 
 ## Install
 
@@ -30,6 +30,7 @@ pi-pack/
 │   │   ├── plan-mode/
 │   │   └── subagent/
 │   ├── skills/                 # Pi skills
+│   ├── prompts/                # Prompt templates
 │   ├── agents/                 # Subagent definitions
 │   └── themes/                 # Pi themes
 └── README.md
@@ -43,6 +44,14 @@ pi-pack/
 |-----------|-------------|
 | **plan-mode** | Think before you act — plan mode for pi |
 | **subagent** | Delegate tasks to specialized sub-agents with isolated context |
+
+### Prompts
+
+| Prompt | Description |
+|--------|-------------|
+| `/implement` | scout → planner → worker workflow |
+| `/scout-and-plan` | scout → planner (no implementation) |
+| `/implement-and-review` | worker → reviewer → worker workflow |
 
 ## Adding Resources
 

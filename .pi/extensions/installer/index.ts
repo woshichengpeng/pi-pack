@@ -9,7 +9,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
-const RESOURCE_TYPES = ["extensions", "skills", "agents", "themes"];
+const RESOURCE_TYPES = ["extensions", "skills", "prompts", "agents", "themes"];
 
 function getPackDir(): string {
 	return path.resolve(__dirname, "..", "..", "..", "pack");
@@ -27,23 +27,33 @@ function linkResources(packDir: string): string[] {
 		fs.mkdirSync(destDir, { recursive: true });
 
 		for (const name of fs.readdirSync(srcDir)) {
+			if (name.startsWith(".")) continue;
+
 			const srcPath = path.join(srcDir, name);
-			if (!fs.statSync(srcPath).isDirectory()) continue;
+			let srcStat: fs.Stats;
+			try {
+				srcStat = fs.lstatSync(srcPath);
+			} catch {
+				continue;
+			}
+
+			if (!srcStat.isDirectory() && !srcStat.isFile()) continue;
 
 			const target = path.join(destDir, name);
 			const label = `${type}/${name}`;
+			const linkType = srcStat.isDirectory() ? "junction" : "file";
 
 			if (fs.existsSync(target)) {
 				const stat = fs.lstatSync(target);
 				if (stat.isSymbolicLink()) {
 					fs.unlinkSync(target);
-					fs.symlinkSync(srcPath, target, "junction");
+					fs.symlinkSync(srcPath, target, linkType);
 					results.push(`↻ ${label} (updated)`);
 				} else {
 					results.push(`✗ ${label} (skipped, non-symlink exists)`);
 				}
 			} else {
-				fs.symlinkSync(srcPath, target, "junction");
+				fs.symlinkSync(srcPath, target, linkType);
 				results.push(`+ ${label}`);
 			}
 		}

@@ -17,40 +17,22 @@ Delegate tasks to specialized subagents with isolated context windows.
 subagent/
 ├── README.md            # This file
 ├── index.ts             # The extension (entry point)
-├── agents.ts            # Agent discovery logic
-├── agents/              # Sample agent definitions
-│   ├── scout.md         # Fast recon, returns compressed context
-│   ├── planner.md       # Creates implementation plans
-│   ├── reviewer.md      # Code review
-│   └── worker.md        # General-purpose (full capabilities)
-└── prompts/             # Workflow presets (prompt templates)
-    ├── implement.md     # scout -> planner -> worker
-    ├── scout-and-plan.md    # scout -> planner (no implementation)
-    └── implement-and-review.md  # worker -> reviewer -> worker
+└── agents.ts            # Agent discovery logic
 ```
+
+This pack also ships:
+- `pack/agents/` — sample agent definitions (installed to `~/.pi/agent/agents`)
+- `pack/prompts/` — workflow prompt templates (installed to `~/.pi/agent/prompts`)
 
 ## Installation
 
-From the repository root, symlink the files:
+From this repo, run `/install` (see the root README). It symlinks:
 
-```bash
-# Symlink the extension (must be in a subdirectory with index.ts)
-mkdir -p ~/.pi/agent/extensions/subagent
-ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/index.ts" ~/.pi/agent/extensions/subagent/index.ts
-ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/agents.ts" ~/.pi/agent/extensions/subagent/agents.ts
+- `pack/extensions/subagent` → `~/.pi/agent/extensions/subagent`
+- `pack/agents/*.md` → `~/.pi/agent/agents/`
+- `pack/prompts/*.md` → `~/.pi/agent/prompts/`
 
-# Symlink agents
-mkdir -p ~/.pi/agent/agents
-for f in packages/coding-agent/examples/extensions/subagent/agents/*.md; do
-  ln -sf "$(pwd)/$f" ~/.pi/agent/agents/$(basename "$f")
-done
-
-# Symlink workflow prompts
-mkdir -p ~/.pi/agent/prompts
-for f in packages/coding-agent/examples/extensions/subagent/prompts/*.md; do
-  ln -sf "$(pwd)/$f" ~/.pi/agent/prompts/$(basename "$f")
-done
-```
+If you’re installing manually, place the extension under `~/.pi/agent/extensions/` and the agent/prompt files under `~/.pi/agent/agents/` and `~/.pi/agent/prompts/`.
 
 ## Security Model
 
@@ -141,6 +123,8 @@ System prompt for the agent goes here.
 
 Project agents override user agents with the same name when `agentScope: "both"`.
 
+This pack provides the sample agents under `pack/agents/` and installs them to `~/.pi/agent/agents/` via `/install`.
+
 ## Sample Agents
 
 | Agent | Purpose | Model | Tools |
@@ -151,6 +135,8 @@ Project agents override user agents with the same name when `agentScope: "both"`
 | `worker` | General-purpose | Sonnet | (all default) |
 
 ## Workflow Prompts
+
+These prompt templates live in `pack/prompts/` and are installed to `~/.pi/agent/prompts/` via `/install`.
 
 | Prompt | Flow |
 |--------|------|
