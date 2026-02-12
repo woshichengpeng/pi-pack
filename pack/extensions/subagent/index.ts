@@ -534,6 +534,7 @@ async function runSingleAgent(
 
 	const args: string[] = ["--mode", "json", "-p"];
 	if (agent.model) args.push("--model", agent.model);
+	if (agent.thinkingLevel) args.push("--thinking", agent.thinkingLevel);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
 	let tmpPromptDir: string | null = null;

@@ -12,7 +12,7 @@ pi source repo: `../pi-mono` (or clone from https://github.com/badlogic/pi-mono 
 
 - `.pi/extensions/installer/` — project-level `/install` command (auto-loaded when pi opens this repo)
 - `pack/extensions/` — pi extensions (`plan-mode`, `subagent`, `copilot-models`)
-- `pack/agents/` — subagent definitions (markdown with frontmatter: `name`, `description`, `tools`, `model`)
+- `pack/agents/` — subagent definitions (markdown with frontmatter: `name`, `description`, `tools`, `model`, `thinkingLevel`)
 - `pack/prompts/` — prompt templates (markdown with frontmatter, `$@` for args, `{previous}` for chain output)
 - `pack/skills/` — pi skills (each a directory with `SKILL.md`)
 - `pack/themes/` — pi themes
@@ -39,3 +39,8 @@ Commits follow loose conventional style: `feat:`, `fix:`, `chore:` prefixes. Sco
 1. Create in the appropriate `pack/` subdirectory
 2. Run `/install` in pi (from this repo)
 3. Run `/reload` in any pi session
+
+
+## Language
+
+Always reply in Chinese (中文).
