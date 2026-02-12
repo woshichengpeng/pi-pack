@@ -34,6 +34,8 @@ const JOB_WIDGET_MAX_ITEMS = 4;
 const JOB_WIDGET_PREVIEW_LIMIT = 80;
 const COMPLETED_JOB_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
 const COMPLETED_JOB_MAX_COUNT = 50;
+const SESSION_MAX_AGE_MS = 2 * 60 * 60 * 1000; // 2 hours
+const SESSION_MAX_COUNT = 50;
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -159,6 +161,7 @@ interface SingleResult {
 	stopReason?: string;
 	errorMessage?: string;
 	step?: number;
+	sessionId?: string;
 }
 
 interface SubagentDetails {
@@ -356,6 +359,87 @@ function writePromptToTempFile(agentName: string, prompt: string): { dir: string
 	return { dir: tmpDir, filePath };
 }
 
+// --- Session management for subagent resume ---
+
+interface SubagentSession {
+	id: string;
+	agent: string;
+	sessionFilePath: string;
+	promptTmpDir: string | null; // keep prompt file alive for continued sessions
+	createdAt: number;
+	lastUsedAt: number;
+	inUse: boolean;
+}
+
+let sessionCounter = 0;
+const subagentSessions = new Map<string, SubagentSession>();
+
+function generateSessionId(): string {
+	return `sa-${process.pid}-${++sessionCounter}`;
+}
+
+function getSessionDir(): string {
+	const dir = path.join(os.tmpdir(), "pi-subagent-sessions");
+	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+	return dir;
+}
+
+function createSession(agentName: string, promptTmpDir: string | null): SubagentSession {
+	const id = generateSessionId();
+	const safeName = agentName.replace(/[^\w.-]+/g, "_");
+	const sessionFilePath = path.join(getSessionDir(), `${id}-${safeName}.jsonl`);
+	const session: SubagentSession = {
+		id,
+		agent: agentName,
+		sessionFilePath,
+		promptTmpDir,
+		createdAt: Date.now(),
+		lastUsedAt: Date.now(),
+		inUse: false,
+	};
+	subagentSessions.set(id, session);
+	evictOldSessions();
+	return session;
+}
+
+function evictOldSessions(): void {
+	const now = Date.now();
+	const toDelete: string[] = [];
+
+	for (const [id, session] of subagentSessions) {
+		if (session.inUse) continue;
+		const age = now - session.lastUsedAt;
+		if (age > SESSION_MAX_AGE_MS) toDelete.push(id);
+	}
+
+	for (const id of toDelete) cleanupSession(id);
+
+	// If still over limit, remove oldest (skip in-use sessions)
+	if (subagentSessions.size > SESSION_MAX_COUNT) {
+		const sorted = Array.from(subagentSessions.entries())
+			.filter(([, s]) => !s.inUse)
+			.sort((a, b) => a[1].lastUsedAt - b[1].lastUsedAt);
+		while (subagentSessions.size > SESSION_MAX_COUNT && sorted.length > 0) {
+			const [id] = sorted.shift()!;
+			cleanupSession(id);
+		}
+	}
+}
+
+function cleanupSession(id: string): void {
+	const session = subagentSessions.get(id);
+	if (!session) return;
+	try {
+		fs.rmSync(session.sessionFilePath, { force: true });
+	} catch { /* ignore */ }
+	if (session.promptTmpDir) {
+		try {
+			fs.rmSync(session.promptTmpDir, { recursive: true, force: true });
+		} catch { /* ignore */ }
+	}
+	subagentSessions.delete(id);
+}
+
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
 async function runSingleAgent(
@@ -368,6 +452,8 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
+	sessionId?: string,
+	enableSession: boolean = true,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -386,12 +472,73 @@ async function runSingleAgent(
 		};
 	}
 
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
+	// Resolve or create session
+	let existingSession: SubagentSession | undefined;
+	if (sessionId) {
+		existingSession = subagentSessions.get(sessionId);
+		if (!existingSession) {
+			return {
+				agent: agentName,
+				agentSource: agent.source,
+				task,
+				exitCode: 1,
+				completed: true,
+				messages: [],
+				stderr: `Session not found: "${sessionId}". It may have expired. Start a new session without sessionId.`,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				step,
+			};
+		}
+		if (existingSession.agent !== agentName) {
+			return {
+				agent: agentName,
+				agentSource: agent.source,
+				task,
+				exitCode: 1,
+				completed: true,
+				messages: [],
+				stderr: `Session "${sessionId}" belongs to agent "${existingSession.agent}", not "${agentName}".`,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				step,
+			};
+		}
+		if (existingSession.inUse) {
+			return {
+				agent: agentName,
+				agentSource: agent.source,
+				task,
+				exitCode: 1,
+				completed: true,
+				messages: [],
+				stderr: `Session "${sessionId}" is currently in use by another invocation. Wait for it to finish.`,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				step,
+			};
+		}
+		if (!fs.existsSync(existingSession.sessionFilePath)) {
+			cleanupSession(sessionId);
+			return {
+				agent: agentName,
+				agentSource: agent.source,
+				task,
+				exitCode: 1,
+				completed: true,
+				messages: [],
+				stderr: `Session file for "${sessionId}" no longer exists on disk. Start a new session without sessionId.`,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				step,
+			};
+		}
+		existingSession.lastUsedAt = Date.now();
+	}
+
+	const args: string[] = ["--mode", "json", "-p"];
 	if (agent.model) args.push("--model", agent.model);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
+	let session: SubagentSession | undefined;
 
 	const currentResult: SingleResult = {
 		agent: agentName,
@@ -416,12 +563,36 @@ async function runSingleAgent(
 	};
 
 	try {
-		if (agent.systemPrompt.trim()) {
-			const tmp = writePromptToTempFile(agent.name, agent.systemPrompt);
-			tmpPromptDir = tmp.dir;
-			tmpPromptPath = tmp.filePath;
-			args.push("--append-system-prompt", tmpPromptPath);
+		if (existingSession) {
+			// Resume existing session
+			args.push("--continue", "--session", existingSession.sessionFilePath);
+			// System prompt is already baked into the session, but we need the prompt file
+			// to still exist if it was used. The session object keeps its promptTmpDir alive.
+			session = existingSession;
+		} else if (enableSession) {
+			// New invocation: create a session for potential future resume
+			if (agent.systemPrompt.trim()) {
+				const tmp = writePromptToTempFile(agent.name, agent.systemPrompt);
+				tmpPromptDir = tmp.dir;
+				tmpPromptPath = tmp.filePath;
+				args.push("--append-system-prompt", tmpPromptPath);
+			}
+			session = createSession(agentName, tmpPromptDir);
+			// Transfer ownership of tmpPromptDir to the session so it persists
+			tmpPromptDir = null;
+			args.push("--session", session.sessionFilePath);
+		} else {
+			// One-shot invocation (chain/parallel steps): no session persistence
+			if (agent.systemPrompt.trim()) {
+				const tmp = writePromptToTempFile(agent.name, agent.systemPrompt);
+				tmpPromptDir = tmp.dir;
+				tmpPromptPath = tmp.filePath;
+				args.push("--append-system-prompt", tmpPromptPath);
+			}
+			args.push("--no-session");
 		}
+
+		if (session) session.inUse = true;
 
 		args.push(`Task: ${task}`);
 		let wasAborted = false;
@@ -502,9 +673,16 @@ async function runSingleAgent(
 
 		currentResult.exitCode = exitCode;
 		currentResult.completed = true;
-		if (wasAborted) throw new Error("Subagent was aborted");
+		if (wasAborted) {
+			// Clean up session on abort — the session file may be corrupted
+			if (session) cleanupSession(session.id);
+			currentResult.sessionId = undefined;
+			throw new Error("Subagent was aborted");
+		}
+		currentResult.sessionId = session?.id;
 		return currentResult;
 	} finally {
+		if (session) session.inUse = false;
 		if (tmpPromptDir)
 			try {
 				fs.rmSync(tmpPromptDir, { recursive: true, force: true });
@@ -534,6 +712,12 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 const SubagentParams = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
+	sessionId: Type.Optional(
+		Type.String({
+			description:
+				"Resume a previous subagent session by its ID (single mode only). The agent will continue with full conversation history.",
+		}),
+	),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
 	agentScope: Type.Optional(AgentScopeSchema),
@@ -628,6 +812,7 @@ async function runForegroundExecution(
 	makeDetails: (mode: "single" | "parallel" | "chain") => (results: SingleResult[]) => SubagentDetails,
 	signal?: AbortSignal,
 	onUpdate?: OnUpdateCallback,
+	sessionId?: string,
 ): Promise<{ content: Array<{ type: string; text: string }>; details: SubagentDetails; isError?: boolean }> {
 	if (params.chain && params.chain.length > 0) {
 		const results: SingleResult[] = [];
@@ -653,6 +838,7 @@ async function runForegroundExecution(
 			const result = await runSingleAgent(
 				cwd, agents, step.agent, taskWithContext, step.cwd, i + 1,
 				signal, chainUpdate, makeDetails("chain"),
+				undefined, false,
 			);
 			results.push(result);
 
@@ -713,6 +899,7 @@ async function runForegroundExecution(
 					}
 				},
 				makeDetails("parallel"),
+				undefined, false,
 			);
 			allResults[index] = result;
 			emitParallelUpdate();
@@ -734,18 +921,22 @@ async function runForegroundExecution(
 	if (params.agent && params.task) {
 		const result = await runSingleAgent(
 			cwd, agents, params.agent, params.task, params.cwd, undefined, signal, onUpdate, makeDetails("single"),
+			sessionId,
 		);
 		const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
 		if (isError) {
 			const errorMsg = result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+			const sessionInfo = result.sessionId ? `\n\n[sessionId: ${result.sessionId}]` : "";
 			return {
-				content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
+				content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}${sessionInfo}` }],
 				details: makeDetails("single")([result]),
 				isError: true,
 			};
 		}
+		const output = getFinalOutput(result.messages) || "(no output)";
+		const sessionInfo = result.sessionId ? `\n\n[sessionId: ${result.sessionId}]` : "";
 		return {
-			content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
+			content: [{ type: "text", text: output + sessionInfo }],
 			details: makeDetails("single")([result]),
 		};
 	}
@@ -808,12 +999,16 @@ export default function (pi: ExtensionAPI) {
 		updateWidget(ctx);
 	});
 
-	// Abort all running background jobs on process exit
+	// Abort all running background jobs and clean up sessions on process exit
 	const abortAllJobs = () => {
 		for (const job of backgroundJobs.values()) {
 			if (job.status === "running" && job.abortController) {
 				job.abortController.abort();
 			}
+		}
+		// Clean up all session files
+		for (const id of Array.from(subagentSessions.keys())) {
+			cleanupSession(id);
 		}
 	};
 	process.on("exit", abortAllJobs);
@@ -939,6 +1134,7 @@ export default function (pi: ExtensionAPI) {
 			'Default agent scope is "user" (from ~/.pi/agent/agents).',
 			'To enable project-local agents in .pi/agents, set agentScope: "both" (or "project").',
 			"Set background: true to run in background and continue chatting.",
+			"To resume a previous conversation with a subagent, pass the sessionId from the previous result.",
 		].join(" "),
 		parameters: SubagentParams,
 
@@ -972,6 +1168,18 @@ export default function (pi: ExtensionAPI) {
 						},
 					],
 					details: makeDetails("single")([]),
+				};
+			}
+
+			if (params.sessionId && !hasSingle) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "sessionId can only be used with single mode (agent + task). It is not supported for chain or parallel.",
+						},
+					],
+					details: makeDetails(hasChain ? "chain" : "parallel")([]),
 				};
 			}
 
@@ -1044,7 +1252,7 @@ export default function (pi: ExtensionAPI) {
 				(async () => {
 					try {
 						const bgResult = await runForegroundExecution(
-							fgParams, capturedCwd, agents, agentScope, discovery, makeDetails, abortController.signal, recordProgress,
+							fgParams, capturedCwd, agents, agentScope, discovery, makeDetails, abortController.signal, recordProgress, fgParams.sessionId,
 						);
 						job.status = bgResult.isError ? "failed" : "completed";
 						job.finishedAt = Date.now();
@@ -1085,7 +1293,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			return runForegroundExecution(params, ctx.cwd, agents, agentScope, discovery, makeDetails, signal, onUpdate);
+			return runForegroundExecution(params, ctx.cwd, agents, agentScope, discovery, makeDetails, signal, onUpdate, params.sessionId);
 		},
 
 		renderCall(args, theme) {
@@ -1125,10 +1333,11 @@ export default function (pi: ExtensionAPI) {
 			}
 			const agentName = args.agent || "...";
 			const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
+			const resumeTag = args.sessionId ? theme.fg("accent", ` ↩ ${args.sessionId}`) : "";
 			let text =
 				theme.fg("toolTitle", theme.bold("subagent ")) +
 				theme.fg("accent", agentName) +
-				theme.fg("muted", ` [${scope}]`) + bgTag;
+				theme.fg("muted", ` [${scope}]`) + bgTag + resumeTag;
 			text += `\n  ${theme.fg("dim", preview)}`;
 			return new Text(text, 0, 0);
 		},
@@ -1200,6 +1409,9 @@ export default function (pi: ExtensionAPI) {
 						container.addChild(new Spacer(1));
 						container.addChild(new Text(theme.fg("dim", usageStr), 0, 0));
 					}
+					if (r.sessionId) {
+						container.addChild(new Text(theme.fg("dim", `session: ${r.sessionId}`), 0, 0));
+					}
 					return container;
 				}
 
@@ -1213,6 +1425,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				const usageStr = formatUsageStats(r.usage, r.model);
 				if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
+				if (r.sessionId) text += `\n${theme.fg("dim", `session: ${r.sessionId}`)}`;
 				return new Text(text, 0, 0);
 			}
 
