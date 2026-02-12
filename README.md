@@ -27,6 +27,7 @@ pi-pack/
 │       └── installer/          # /install command (project-level, auto-loaded)
 ├── pack/
 │   ├── extensions/             # Pi extensions
+│   │   ├── copilot-models/
 │   │   ├── plan-mode/
 │   │   └── subagent/
 │   ├── skills/                 # Pi skills
@@ -44,6 +45,7 @@ pi-pack/
 |-----------|-------------|
 | **plan-mode** | Think before you act — plan mode for pi |
 | **subagent** | Delegate tasks to specialized sub-agents with isolated context |
+| **copilot-models** | Auto-discover additional GitHub Copilot models from the live API |
 
 ### Prompts
 
