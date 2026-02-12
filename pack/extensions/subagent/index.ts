@@ -548,7 +548,7 @@ const SubagentParams = Type.Object({
 	background: Type.Optional(
 		Type.Boolean({
 			description:
-				"Run in background. Returns immediately with a job ID. Use subagent_jobs tool to check status and retrieve results.",
+				"Run in background. Returns immediately with a job ID. A notification will appear when the job finishes.",
 			default: false,
 		}),
 	),
@@ -853,6 +853,7 @@ export default function (pi: ExtensionAPI) {
 					} else {
 						text += "\n\n(no output yet)";
 					}
+					text += "\n\nA notification will appear when the job finishes. Continue with other work.";
 					return {
 						content: [
 							{
@@ -907,7 +908,7 @@ export default function (pi: ExtensionAPI) {
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
 			'Default agent scope is "user" (from ~/.pi/agent/agents).',
 			'To enable project-local agents in .pi/agents, set agentScope: "both" (or "project").',
-			"Set background: true to run in background and continue chatting. Use subagent_jobs tool to check results.",
+			"Set background: true to run in background and continue chatting.",
 		].join(" "),
 		parameters: SubagentParams,
 
@@ -1034,7 +1035,7 @@ export default function (pi: ExtensionAPI) {
 					const icon = job.status === "completed" ? "✓" : "✗";
 					if (latestCtx?.ui?.notify) {
 						latestCtx.ui.notify(
-							`${icon} Background job ${jobId} ${job.status} (${elapsed}s)\nAgent: ${job.agent}\nUse subagent_jobs tool with action "get" and jobId "${jobId}" to see results.`,
+							`${icon} Background job ${jobId} ${job.status} (${elapsed}s)\nAgent: ${job.agent}\nUse subagent_jobs with action "get" and jobId "${jobId}" to retrieve the result.`,
 							job.status === "completed" ? "info" : "error",
 						);
 					}
@@ -1044,7 +1045,7 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: `Background job started: ${jobId}\nAgent: ${agentName}, Mode: ${mode}\nUse subagent_jobs tool with action "get" and jobId "${jobId}" to check results later.`,
+							text: `Background job started: ${jobId}\nAgent: ${agentName}, Mode: ${mode}\nA notification will appear when the job finishes. Continue with other work and retrieve results after the notification.`,
 						},
 					],
 					details: makeDetails(mode)([]),
