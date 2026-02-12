@@ -32,6 +32,8 @@ const PROGRESS_MAX_ITEMS = 6;
 const JOB_WIDGET_REFRESH_MS = 2000;
 const JOB_WIDGET_MAX_ITEMS = 4;
 const JOB_WIDGET_PREVIEW_LIMIT = 80;
+const COMPLETED_JOB_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
+const COMPLETED_JOB_MAX_COUNT = 50;
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -503,15 +505,9 @@ async function runSingleAgent(
 		if (wasAborted) throw new Error("Subagent was aborted");
 		return currentResult;
 	} finally {
-		if (tmpPromptPath)
-			try {
-				fs.unlinkSync(tmpPromptPath);
-			} catch {
-				/* ignore */
-			}
 		if (tmpPromptDir)
 			try {
-				fs.rmdirSync(tmpPromptDir);
+				fs.rmSync(tmpPromptDir, { recursive: true, force: true });
 			} catch {
 				/* ignore */
 			}
@@ -568,6 +564,7 @@ interface BackgroundJob {
 	finishedAt?: number;
 	lastUpdateAt?: number;
 	lastSummary?: string;
+	abortController?: AbortController;
 	result?: {
 		content: Array<{ type: "text"; text: string }>;
 		details: SubagentDetails;
@@ -580,6 +577,27 @@ const backgroundJobs = new Map<string, BackgroundJob>();
 
 function generateJobId(): string {
 	return `job-${++jobCounter}`;
+}
+
+function evictOldJobs(): void {
+	const now = Date.now();
+	const completed = Array.from(backgroundJobs.entries())
+		.filter(([, j]) => j.status !== "running")
+		.sort((a, b) => (a[1].finishedAt ?? 0) - (b[1].finishedAt ?? 0));
+
+	for (const [id, job] of completed) {
+		const age = now - (job.finishedAt ?? job.startedAt);
+		if (age > COMPLETED_JOB_MAX_AGE_MS) backgroundJobs.delete(id);
+	}
+
+	// If still over limit, remove oldest
+	const remaining = Array.from(backgroundJobs.entries())
+		.filter(([, j]) => j.status !== "running")
+		.sort((a, b) => (a[1].finishedAt ?? 0) - (b[1].finishedAt ?? 0));
+	while (remaining.length > COMPLETED_JOB_MAX_COUNT) {
+		const [id] = remaining.shift()!;
+		backgroundJobs.delete(id);
+	}
 }
 
 function getRunningJobs(): BackgroundJob[] {
@@ -790,6 +808,18 @@ export default function (pi: ExtensionAPI) {
 		updateWidget(ctx);
 	});
 
+	// Abort all running background jobs on process exit
+	const abortAllJobs = () => {
+		for (const job of backgroundJobs.values()) {
+			if (job.status === "running" && job.abortController) {
+				job.abortController.abort();
+			}
+		}
+	};
+	process.on("exit", abortAllJobs);
+	process.on("SIGINT", abortAllJobs);
+	process.on("SIGTERM", abortAllJobs);
+
 	// --- /jobs command ---
 	pi.registerCommand("jobs", {
 		description: "List background subagent jobs",
@@ -973,10 +1003,12 @@ export default function (pi: ExtensionAPI) {
 			// --- Background mode: dispatch and return immediately ---
 			if (params.background) {
 				const jobId = generateJobId();
+				evictOldJobs();
 				const mode = hasChain ? "chain" : hasTasks ? "parallel" : "single";
 				const agentName = params.agent || (params.chain?.[0]?.agent) || (params.tasks?.[0]?.agent) || "unknown";
 				const taskDesc = params.task || (params.chain?.[0]?.task) || (params.tasks?.map((t) => t.agent).join(", ")) || "unknown";
 
+				const abortController = new AbortController();
 				const job: BackgroundJob = {
 					id: jobId,
 					status: "running",
@@ -984,6 +1016,7 @@ export default function (pi: ExtensionAPI) {
 					task: taskDesc,
 					mode,
 					startedAt: Date.now(),
+					abortController,
 				};
 				backgroundJobs.set(jobId, job);
 				updateWidget(ctx);
@@ -1011,7 +1044,7 @@ export default function (pi: ExtensionAPI) {
 				(async () => {
 					try {
 						const bgResult = await runForegroundExecution(
-							fgParams, capturedCwd, agents, agentScope, discovery, makeDetails, undefined, recordProgress,
+							fgParams, capturedCwd, agents, agentScope, discovery, makeDetails, abortController.signal, recordProgress,
 						);
 						job.status = bgResult.isError ? "failed" : "completed";
 						job.finishedAt = Date.now();
