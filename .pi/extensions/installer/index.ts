@@ -4,6 +4,7 @@
  * Usage: /install (auto-available when pi is opened in this repo)
  */
 
+import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -62,6 +63,33 @@ function linkResources(packDir: string): string[] {
 	return results;
 }
 
+function installDependencies(packDir: string): string[] {
+	const results: string[] = [];
+
+	for (const type of RESOURCE_TYPES) {
+		const srcDir = path.join(packDir, type);
+		if (!fs.existsSync(srcDir)) continue;
+
+		for (const name of fs.readdirSync(srcDir)) {
+			if (name.startsWith(".")) continue;
+			const itemDir = path.join(srcDir, name);
+			const pkgJson = path.join(itemDir, "package.json");
+			const nodeModules = path.join(itemDir, "node_modules");
+
+			if (fs.existsSync(pkgJson) && !fs.existsSync(nodeModules)) {
+				try {
+					execSync("npm install --production", { cwd: itemDir, stdio: "pipe" });
+					results.push(`📦 ${type}/${name} (npm install)`);
+				} catch (e: any) {
+					results.push(`✗ ${type}/${name} (npm install failed: ${e.message})`);
+				}
+			}
+		}
+	}
+
+	return results;
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.registerCommand("install", {
 		description: "Symlink all pack resources to ~/.pi/agent/",
@@ -73,11 +101,13 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const results = linkResources(packDir);
+			const depResults = installDependencies(packDir);
+			const allResults = [...results, ...depResults];
 
-			if (results.length === 0) {
+			if (allResults.length === 0) {
 				ctx.ui.notify("Nothing to install.", "info");
 			} else {
-				ctx.ui.notify(results.join("\n"), "info");
+				ctx.ui.notify(allResults.join("\n"), "info");
 			}
 		},
 	});
