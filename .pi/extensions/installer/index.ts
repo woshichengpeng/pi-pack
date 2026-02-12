@@ -100,6 +100,17 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			// Pull latest changes first
+			const repoDir = path.resolve(packDir, "..");
+			try {
+				const pullOutput = execSync("git pull", { cwd: repoDir, stdio: "pipe" }).toString().trim();
+				if (pullOutput && pullOutput !== "Already up to date.") {
+					ctx.ui.notify(`git pull: ${pullOutput}`, "info");
+				}
+			} catch (e: any) {
+				ctx.ui.notify(`git pull failed: ${e.message}`, "error");
+			}
+
 			const results = linkResources(packDir);
 			const depResults = installDependencies(packDir);
 			const allResults = [...results, ...depResults];
