@@ -19,7 +19,7 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
 import { StringEnum } from "@mariozechner/pi-ai";
-import { type ExtensionAPI, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
@@ -27,6 +27,11 @@ import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
+const PROGRESS_PREVIEW_LIMIT = 120;
+const PROGRESS_MAX_ITEMS = 6;
+const JOB_WIDGET_REFRESH_MS = 2000;
+const JOB_WIDGET_MAX_ITEMS = 4;
+const JOB_WIDGET_PREVIEW_LIMIT = 80;
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -144,6 +149,7 @@ interface SingleResult {
 	agentSource: "user" | "project" | "unknown";
 	task: string;
 	exitCode: number;
+	completed: boolean;
 	messages: Message[];
 	stderr: string;
 	usage: UsageStats;
@@ -185,6 +191,139 @@ function getDisplayItems(messages: Message[]): DisplayItem[] {
 		}
 	}
 	return items;
+}
+
+function formatToolCallPlain(toolName: string, args: Record<string, unknown>): string {
+	const shortenPath = (p: string) => {
+		const home = os.homedir();
+		return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
+	};
+
+	switch (toolName) {
+		case "bash": {
+			const command = (args.command as string) || "...";
+			const preview = command.length > 60 ? `${command.slice(0, 60)}...` : command;
+			return `$ ${preview}`;
+		}
+		case "read": {
+			const rawPath = (args.file_path || args.path || "...") as string;
+			const filePath = shortenPath(rawPath);
+			const offset = args.offset as number | undefined;
+			const limit = args.limit as number | undefined;
+			let text = `read ${filePath}`;
+			if (offset !== undefined || limit !== undefined) {
+				const startLine = offset ?? 1;
+				const endLine = limit !== undefined ? startLine + limit - 1 : "";
+				text += `:${startLine}${endLine ? `-${endLine}` : ""}`;
+			}
+			return text;
+		}
+		case "write": {
+			const rawPath = (args.file_path || args.path || "...") as string;
+			const filePath = shortenPath(rawPath);
+			const content = (args.content || "") as string;
+			const lines = content.split("\n").length;
+			return `write ${filePath}${lines > 1 ? ` (${lines} lines)` : ""}`;
+		}
+		case "edit": {
+			const rawPath = (args.file_path || args.path || "...") as string;
+			return `edit ${shortenPath(rawPath)}`;
+		}
+		case "ls": {
+			const rawPath = (args.path || ".") as string;
+			return `ls ${shortenPath(rawPath)}`;
+		}
+		case "find": {
+			const pattern = (args.pattern || "*") as string;
+			const rawPath = (args.path || ".") as string;
+			return `find ${pattern} in ${shortenPath(rawPath)}`;
+		}
+		case "grep": {
+			const pattern = (args.pattern || "") as string;
+			const rawPath = (args.path || ".") as string;
+			return `grep /${pattern}/ in ${shortenPath(rawPath)}`;
+		}
+		default: {
+			const argsStr = JSON.stringify(args);
+			const preview = argsStr.length > 50 ? `${argsStr.slice(0, 50)}...` : argsStr;
+			return `${toolName} ${preview}`;
+		}
+	}
+}
+
+function formatPreviewText(text: string, maxLength = PROGRESS_PREVIEW_LIMIT): string {
+	const cleaned = text.replace(/\s+/g, " ").trim();
+	if (!cleaned) return "(no output yet)";
+	return cleaned.length > maxLength ? `${cleaned.slice(0, maxLength)}...` : cleaned;
+}
+
+function formatDisplayItemPlain(item: DisplayItem): string {
+	if (item.type === "text") return formatPreviewText(item.text);
+	return `→ ${formatToolCallPlain(item.name, item.args)}`;
+}
+
+function summarizeProgress(details: SubagentDetails, isRunning: boolean): string {
+	if (!details.results.length) return "(no output yet)";
+
+	const getPreview = (result: SingleResult) => {
+		const items = getDisplayItems(result.messages);
+		if (!items.length) return "(no output yet)";
+		return formatDisplayItemPlain(items[items.length - 1]);
+	};
+
+	const statusFor = (result: SingleResult): string => {
+		if (!result.completed) return "running";
+		return result.exitCode === 0 ? "done" : "failed";
+	};
+
+	if (details.mode === "single" && details.results.length === 1) {
+		const r = details.results[0];
+		const status = isRunning ? "running" : statusFor(r);
+		return `${r.agent} (${status}) ${getPreview(r)}`;
+	}
+
+	if (details.mode === "chain") {
+		const total = details.results.length;
+		const lines: string[] = [];
+		const header = isRunning
+			? `Chain running: ${total} step${total > 1 ? "s" : ""}`
+			: `Chain completed: ${total} step${total > 1 ? "s" : ""}`;
+		lines.push(header);
+
+		const startIndex = Math.max(0, total - PROGRESS_MAX_ITEMS);
+		if (startIndex > 0) lines.push(`... ${startIndex} earlier step${startIndex > 1 ? "s" : ""} hidden`);
+
+		for (let i = startIndex; i < total; i++) {
+			const r = details.results[i];
+			const stepLabel = r.step ?? i + 1;
+			const status = isRunning && i === total - 1 ? "running" : statusFor(r);
+			lines.push(`${stepLabel}. ${r.agent} (${status}) ${getPreview(r)}`);
+		}
+		return lines.join("\n");
+	}
+
+	if (details.mode === "parallel") {
+		const total = details.results.length;
+		const running = details.results.filter((r) => !r.completed).length;
+		const failed = details.results.filter((r) => r.completed && r.exitCode > 0).length;
+		const succeeded = details.results.filter((r) => r.completed && r.exitCode === 0).length;
+
+		const header = isRunning
+			? `Parallel running: ${succeeded + failed}/${total} done, ${running} running`
+			: `Parallel completed: ${succeeded}/${total} succeeded`;
+		const lines: string[] = [header];
+
+		const limit = Math.min(total, PROGRESS_MAX_ITEMS);
+		for (let i = 0; i < limit; i++) {
+			const r = details.results[i];
+			const status = statusFor(r);
+			lines.push(`${i + 1}. ${r.agent} (${status}) ${getPreview(r)}`);
+		}
+		if (total > limit) lines.push(`... +${total - limit} more`);
+		return lines.join("\n");
+	}
+
+	return "(no output yet)";
 }
 
 async function mapWithConcurrencyLimit<TIn, TOut>(
@@ -237,6 +376,7 @@ async function runSingleAgent(
 			agentSource: "unknown",
 			task,
 			exitCode: 1,
+			completed: true,
 			messages: [],
 			stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
@@ -256,6 +396,7 @@ async function runSingleAgent(
 		agentSource: agent.source,
 		task,
 		exitCode: 0,
+		completed: false,
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
@@ -358,6 +499,7 @@ async function runSingleAgent(
 		});
 
 		currentResult.exitCode = exitCode;
+		currentResult.completed = true;
 		if (wasAborted) throw new Error("Subagent was aborted");
 		return currentResult;
 	} finally {
@@ -424,6 +566,8 @@ interface BackgroundJob {
 	mode: "single" | "parallel" | "chain";
 	startedAt: number;
 	finishedAt?: number;
+	lastUpdateAt?: number;
+	lastSummary?: string;
 	result?: {
 		content: Array<{ type: "text"; text: string }>;
 		details: SubagentDetails;
@@ -438,18 +582,22 @@ function generateJobId(): string {
 	return `job-${++jobCounter}`;
 }
 
-function getRunningJobCount(): number {
-	let count = 0;
-	for (const job of backgroundJobs.values()) {
-		if (job.status === "running") count++;
-	}
-	return count;
+function getRunningJobs(): BackgroundJob[] {
+	return Array.from(backgroundJobs.values()).filter((job) => job.status === "running");
 }
 
 function formatJobSummary(job: BackgroundJob): string {
 	const elapsed = ((job.finishedAt ?? Date.now()) - job.startedAt) / 1000;
 	const icon = job.status === "running" ? "⏳" : job.status === "completed" ? "✓" : "✗";
 	return `${icon} ${job.id} [${job.mode}] ${job.agent}: ${job.task.slice(0, 60)}${job.task.length > 60 ? "..." : ""} (${job.status}, ${elapsed.toFixed(1)}s)`;
+}
+
+function formatJobWidgetLine(job: BackgroundJob): string {
+	const summary = job.lastSummary
+		? formatPreviewText(job.lastSummary, JOB_WIDGET_PREVIEW_LIMIT)
+		: "(no output yet)";
+	const elapsed = ((Date.now() - job.startedAt) / 1000).toFixed(0);
+	return `• ${job.id} ${job.agent} (${elapsed}s): ${summary}`;
 }
 
 // Extracted foreground execution logic so it can be reused by background mode
@@ -518,15 +666,18 @@ async function runForegroundExecution(
 		for (let i = 0; i < params.tasks.length; i++) {
 			allResults[i] = {
 				agent: params.tasks[i].agent, agentSource: "unknown", task: params.tasks[i].task,
-				exitCode: -1, messages: [], stderr: "",
+				exitCode: -1,
+				completed: false,
+				messages: [],
+				stderr: "",
 				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 			};
 		}
 
 		const emitParallelUpdate = () => {
 			if (onUpdate) {
-				const running = allResults.filter((r) => r.exitCode === -1).length;
-				const done = allResults.filter((r) => r.exitCode !== -1).length;
+				const running = allResults.filter((r) => !r.completed).length;
+				const done = allResults.filter((r) => r.completed).length;
 				onUpdate({
 					content: [{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` }],
 					details: makeDetails("parallel")([...allResults]),
@@ -590,17 +741,49 @@ async function runForegroundExecution(
 
 export default function (pi: ExtensionAPI) {
 	// --- Widget: show background job count ---
-	function updateWidget(ctx?: { ui: { setWidget: (id: string, lines: string[] | undefined) => void } }) {
-		const running = getRunningJobCount();
-		if (running > 0 && ctx) {
-			ctx.ui.setWidget("subagent-jobs", [`⏳ ${running} background job${running > 1 ? "s" : ""} running`]);
-		} else if (ctx) {
-			ctx.ui.setWidget("subagent-jobs", undefined);
+	let latestCtx: ExtensionContext | null = null;
+	let widgetRefreshTimer: ReturnType<typeof setInterval> | null = null;
+
+	function stopWidgetRefresh() {
+		if (widgetRefreshTimer) {
+			clearInterval(widgetRefreshTimer);
+			widgetRefreshTimer = null;
 		}
 	}
 
+	function startWidgetRefresh() {
+		if (widgetRefreshTimer) return;
+		widgetRefreshTimer = setInterval(() => {
+			if (!latestCtx?.hasUI) return;
+			updateWidget(latestCtx);
+		}, JOB_WIDGET_REFRESH_MS);
+	}
+
+	function updateWidget(ctx?: ExtensionContext) {
+		if (!ctx?.hasUI) {
+			stopWidgetRefresh();
+			return;
+		}
+
+		const runningJobs = getRunningJobs();
+		if (runningJobs.length === 0) {
+			ctx.ui.setWidget("subagent-jobs", undefined);
+			stopWidgetRefresh();
+			return;
+		}
+
+		startWidgetRefresh();
+		const lines: string[] = [`⏳ ${runningJobs.length} background job${runningJobs.length > 1 ? "s" : ""} running`];
+		for (const job of runningJobs.slice(0, JOB_WIDGET_MAX_ITEMS)) {
+			lines.push(formatJobWidgetLine(job));
+		}
+		if (runningJobs.length > JOB_WIDGET_MAX_ITEMS) {
+			lines.push(`… +${runningJobs.length - JOB_WIDGET_MAX_ITEMS} more`);
+		}
+		ctx.ui.setWidget("subagent-jobs", lines);
+	}
+
 	// Store ctx reference for background job completion notifications
-	let latestCtx: any = null;
 
 	pi.on("agent_start", async (_event, ctx) => {
 		latestCtx = ctx;
@@ -629,7 +812,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent Jobs",
 		description: [
 			"Query background subagent jobs.",
-			"Actions: list (show all jobs), get (retrieve result by job ID), clear (remove finished jobs).",
+			"Actions: list (show all jobs), get (retrieve result or latest progress by job ID), clear (remove finished jobs).",
 		].join(" "),
 		parameters: Type.Object({
 			action: StringEnum(["list", "get", "clear"] as const, {
@@ -663,11 +846,18 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (job.status === "running") {
 					const elapsed = ((Date.now() - job.startedAt) / 1000).toFixed(1);
+					let text = `Job ${job.id} is still running (${elapsed}s elapsed). Agent: ${job.agent}, Task: ${job.task}`;
+					if (job.lastSummary) {
+						const age = job.lastUpdateAt ? ((Date.now() - job.lastUpdateAt) / 1000).toFixed(1) : null;
+						text += `\n\nLatest update${age ? ` (${age}s ago)` : ""}:\n${job.lastSummary}`;
+					} else {
+						text += "\n\n(no output yet)";
+					}
 					return {
 						content: [
 							{
 								type: "text",
-								text: `Job ${job.id} is still running (${elapsed}s elapsed). Agent: ${job.agent}, Task: ${job.task}`,
+								text,
 							},
 						],
 					};
@@ -801,11 +991,26 @@ export default function (pi: ExtensionAPI) {
 				const fgParams = { ...params, background: false };
 				const capturedCwd = ctx.cwd;
 
+				const recordProgress: OnUpdateCallback = (partial) => {
+					const details = partial.details as SubagentDetails | undefined;
+					let summary = details ? summarizeProgress(details, true) : "";
+					if (!summary) {
+						const textPart = partial.content?.find((part) => part.type === "text") as
+							| { type: "text"; text: string }
+							| undefined;
+						if (textPart?.text) summary = formatPreviewText(textPart.text);
+					}
+					if (summary) {
+						job.lastSummary = summary;
+						job.lastUpdateAt = Date.now();
+					}
+				};
+
 				// Fire and forget — run the same execute logic in background
 				(async () => {
 					try {
 						const bgResult = await runForegroundExecution(
-							fgParams, capturedCwd, agents, agentScope, discovery, makeDetails,
+							fgParams, capturedCwd, agents, agentScope, discovery, makeDetails, undefined, recordProgress,
 						);
 						job.status = bgResult.isError ? "failed" : "completed";
 						job.finishedAt = Date.now();
@@ -1073,9 +1278,9 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (details.mode === "parallel") {
-				const running = details.results.filter((r) => r.exitCode === -1).length;
-				const successCount = details.results.filter((r) => r.exitCode === 0).length;
-				const failCount = details.results.filter((r) => r.exitCode > 0).length;
+				const running = details.results.filter((r) => !r.completed).length;
+				const successCount = details.results.filter((r) => r.completed && r.exitCode === 0).length;
+				const failCount = details.results.filter((r) => r.completed && r.exitCode > 0).length;
 				const isRunning = running > 0;
 				const icon = isRunning
 					? theme.fg("warning", "⏳")
@@ -1142,7 +1347,7 @@ export default function (pi: ExtensionAPI) {
 				let text = `${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`;
 				for (const r of details.results) {
 					const rIcon =
-						r.exitCode === -1
+						!r.completed
 							? theme.fg("warning", "⏳")
 							: r.exitCode === 0
 								? theme.fg("success", "✓")
@@ -1150,7 +1355,7 @@ export default function (pi: ExtensionAPI) {
 					const displayItems = getDisplayItems(r.messages);
 					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
 					if (displayItems.length === 0)
-						text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;
+						text += `\n${theme.fg("muted", !r.completed ? "(running...)" : "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
 				}
 				if (!isRunning) {
