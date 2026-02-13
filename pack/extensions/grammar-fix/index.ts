@@ -18,7 +18,7 @@
 
 import { complete, type Api, type Model, type UserMessage } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Key } from "@mariozechner/pi-tui";
+import { Container, Key, Text, type Theme, type TUI } from "@mariozechner/pi-tui";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -163,6 +163,10 @@ export default function grammarFixExtension(pi: ExtensionAPI): void {
 	// Latest context reference for async widget updates
 	let latestCtx: ExtensionContext | null = null;
 
+	// Widget expand/collapse state
+	let widgetExpanded = false;
+	let latestResult: GrammarResult | null = null;
+
 	async function getCheapModel(ctx: ExtensionContext): Promise<CheapModel | null> {
 		if (cachedModel !== undefined) return cachedModel;
 		cachedModel = (await findCheapModel(ctx)) ?? null;
@@ -183,17 +187,44 @@ export default function grammarFixExtension(pi: ExtensionAPI): void {
 	// ── Widget display ──────────────────────────────────────────────────
 
 	function showCorrectionWidget(ctx: ExtensionContext, result: GrammarResult): void {
-		const lines: string[] = [
-			ctx.ui.theme.fg("accent", "✏️ Grammar Fix") +
-				ctx.ui.theme.fg("dim", " (applied to LLM context)"),
-			ctx.ui.theme.fg("success", `   "${result.corrected}"`),
-			ctx.ui.theme.fg("dim", `   Changes: ${result.changes}`),
-		];
-		ctx.ui.setWidget("grammar-fix", lines);
+		// Reset expand state when a new correction arrives
+		if (result !== latestResult) widgetExpanded = false;
+		latestResult = result;
+		ctx.ui.setWidget("grammar-fix", (_tui: TUI, theme: Theme) => {
+			const MAX_PREVIEW_LEN = 120;
+
+			const container = new Container();
+
+			const collapseHint = widgetExpanded
+				? theme.fg("dim", " (Ctrl+Shift+O to collapse)")
+				: theme.fg("dim", " (Ctrl+Shift+O to expand)");
+			container.addChild(new Text(
+				theme.fg("accent", "✏️ Grammar Fix") +
+					theme.fg("dim", " (applied to LLM context)") +
+					collapseHint,
+				1, 0,
+			));
+
+			if (widgetExpanded) {
+				container.addChild(new Text(theme.fg("success", `   "${result.corrected}"`), 1, 0));
+			} else {
+				let preview = result.corrected.replace(/\n/g, " ").trim();
+				if (preview.length > MAX_PREVIEW_LEN) {
+					preview = preview.slice(0, MAX_PREVIEW_LEN) + "…";
+				}
+				container.addChild(new Text(theme.fg("success", `   "${preview}"`), 1, 0));
+			}
+
+			container.addChild(new Text(theme.fg("dim", `   Changes: ${result.changes}`), 1, 0));
+
+			return container;
+		});
 	}
 
 	function clearWidget(ctx: ExtensionContext): void {
 		ctx.ui.setWidget("grammar-fix", undefined);
+		latestResult = null;
+		widgetExpanded = false;
 	}
 
 	function resetState(): void {
@@ -201,6 +232,8 @@ export default function grammarFixExtension(pi: ExtensionAPI): void {
 		asyncAbort?.abort();
 		asyncAbort = null;
 		cachedModel = undefined;
+		latestResult = null;
+		widgetExpanded = false;
 	}
 
 	// ── Async correction (default mode) ─────────────────────────────────
@@ -351,6 +384,17 @@ export default function grammarFixExtension(pi: ExtensionAPI): void {
 
 			ctx.ui.setEditorText(result.corrected);
 			showCorrectionWidget(ctx, result);
+		},
+	});
+
+	// ── Shortcut: Ctrl+Shift+O — toggle grammar widget expand/collapse ──
+
+	pi.registerShortcut(Key.ctrlShift("o"), {
+		description: "Toggle grammar fix widget expand/collapse",
+		handler: async (ctx) => {
+			if (!latestResult) return;
+			widgetExpanded = !widgetExpanded;
+			showCorrectionWidget(ctx, latestResult);
 		},
 	});
 
