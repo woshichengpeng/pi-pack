@@ -173,6 +173,10 @@ async function fetchPageContent(url, maxChars = 2000) {
 	}
 }
 
+// Hard cap: max total output size (chars) to prevent context overflow
+// Even if user requests more via --max-content or -n, total output is capped
+const MAX_TOTAL_OUTPUT_CHARS = 15000;
+
 // Main
 try {
 	const results = await fetchBraveResults(query, numResults, country, freshness);
@@ -183,25 +187,36 @@ try {
 	}
 
 	if (fetchContent) {
+		// Clamp max-content to a reasonable per-page limit
+		const effectiveMaxContent = Math.min(maxContentChars, 2000);
 		for (const result of results) {
-			result.content = await fetchPageContent(result.link, maxContentChars);
+			result.content = await fetchPageContent(result.link, effectiveMaxContent);
 		}
 	}
 
+	let output = '';
 	for (let i = 0; i < results.length; i++) {
 		const r = results[i];
-		console.log(`--- Result ${i + 1} ---`);
-		console.log(`Title: ${r.title}`);
-		console.log(`Link: ${r.link}`);
+		let entry = `--- Result ${i + 1} ---\n`;
+		entry += `Title: ${r.title}\n`;
+		entry += `Link: ${r.link}\n`;
 		if (r.age) {
-			console.log(`Age: ${r.age}`);
+			entry += `Age: ${r.age}\n`;
 		}
-		console.log(`Snippet: ${r.snippet}`);
+		entry += `Snippet: ${r.snippet}\n`;
 		if (r.content) {
-			console.log(`Content:\n${r.content}`);
+			entry += `Content:\n${r.content}\n`;
 		}
-		console.log("");
+		entry += '\n';
+
+		if (output.length + entry.length > MAX_TOTAL_OUTPUT_CHARS) {
+			// Include truncation notice
+			output += `\n(Output truncated at ${MAX_TOTAL_OUTPUT_CHARS} chars. ${results.length - i} more results omitted.)\n`;
+			break;
+		}
+		output += entry;
 	}
+	process.stdout.write(output);
 } catch (e) {
 	console.error(`Error: ${e.message}`);
 	process.exit(1);
