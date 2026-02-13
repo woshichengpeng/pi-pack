@@ -34,6 +34,14 @@ if (freshnessIndex !== -1 && args[freshnessIndex + 1]) {
 	args.splice(freshnessIndex, 2);
 }
 
+// Parse max-content option (max chars per page content, default 2000)
+let maxContentChars = 2000;
+const maxContentIndex = args.indexOf("--max-content");
+if (maxContentIndex !== -1 && args[maxContentIndex + 1]) {
+	maxContentChars = parseInt(args[maxContentIndex + 1], 10);
+	args.splice(maxContentIndex, 2);
+}
+
 const query = args.join(" ");
 
 if (!query) {
@@ -41,6 +49,7 @@ if (!query) {
 	console.log("\nOptions:");
 	console.log("  -n <num>              Number of results (default: 5, max: 20)");
 	console.log("  --content             Fetch readable content as markdown");
+	console.log("  --max-content <chars> Max chars per page content (default: 2000)");
 	console.log("  --country <code>      Country code for results (default: US)");
 	console.log("  --freshness <period>  Filter by time: pd (day), pw (week), pm (month), py (year)");
 	console.log("\nEnvironment:");
@@ -124,7 +133,7 @@ function htmlToMarkdown(html) {
 		.trim();
 }
 
-async function fetchPageContent(url) {
+async function fetchPageContent(url, maxChars = 2000) {
 	try {
 		const response = await fetch(url, {
 			headers: {
@@ -144,7 +153,7 @@ async function fetchPageContent(url) {
 		const article = reader.parse();
 
 		if (article && article.content) {
-			return htmlToMarkdown(article.content).substring(0, 5000);
+			return htmlToMarkdown(article.content).substring(0, maxChars);
 		}
 
 		// Fallback: try to get main content
@@ -155,7 +164,7 @@ async function fetchPageContent(url) {
 		const text = main?.textContent || "";
 
 		if (text.trim().length > 100) {
-			return text.trim().substring(0, 5000);
+			return text.trim().substring(0, maxChars);
 		}
 
 		return "(Could not extract content)";
@@ -175,7 +184,7 @@ try {
 
 	if (fetchContent) {
 		for (const result of results) {
-			result.content = await fetchPageContent(result.link);
+			result.content = await fetchPageContent(result.link, maxContentChars);
 		}
 	}
 
