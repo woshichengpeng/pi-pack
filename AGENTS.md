@@ -19,8 +19,8 @@ pi source repo: `../pi-mono` (or clone from https://github.com/badlogic/pi-mono 
 
 ## Dev Commands
 
-- **Install**: run `pi` in repo root, then `/install` — symlinks `pack/*` to `~/.pi/agent/`, runs `npm install` for items with `package.json`
-- **Reload**: `/reload` in any pi session after changes
+- **Install**: run `pi` in repo root, then `/install` — symlinks `pack/*` to `~/.pi/agent/`, runs `npm install` for items with `package.json`, then auto-runs runtime reload
+- **Reload**: `/reload` in any pi session after changes (or run `/install` again)
 
 ## Code Style
 

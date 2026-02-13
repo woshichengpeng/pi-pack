@@ -35,7 +35,7 @@ When new models are discovered, a `🤖 +N copilot` indicator appears in the foo
 The extension uses the same authentication and headers as the built-in Copilot models. It calls `GET {baseUrl}/models` to retrieve the full catalog, then registers new models using `pi.registerProvider()`.
 
 Model configuration is inferred from the API response:
-- **API type**: Based on `supported_endpoints` (completions vs responses)
+- **API type**: Based on `supported_endpoints` (`/v1/messages` → `anthropic-messages`, `/responses` → `openai-responses`, otherwise completions)
 - **Reasoning**: Based on model family (Claude, o-series, GPT-5, etc.)
 - **Vision**: Based on vendor (Anthropic, OpenAI, Google, xAI)
 - **Context/tokens**: From the API's `capabilities.limits`

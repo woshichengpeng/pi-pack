@@ -117,9 +117,13 @@ export default function (pi: ExtensionAPI) {
 
 			if (allResults.length === 0) {
 				ctx.ui.notify("Nothing to install.", "info");
-			} else {
-				ctx.ui.notify(allResults.join("\n"), "info");
+				return;
 			}
+
+			ctx.ui.notify(allResults.join("\n"), "info");
+			ctx.ui.notify("Install complete. Reloading runtime...", "info");
+			await ctx.reload();
+			return;
 		},
 	});
 }

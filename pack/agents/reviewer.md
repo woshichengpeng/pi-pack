@@ -2,7 +2,7 @@
 name: reviewer
 description: Code review specialist for quality and security analysis
 tools: read, grep, find, ls, bash
-model: github-copilot/gpt-5.3-codex
+model: github-copilot/gpt-5.2-codex
 thinkingLevel: high
 ---
 

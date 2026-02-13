@@ -81,11 +81,23 @@ function determineApi(model: CopilotModel): Api {
 
 	const hasResponses = endpoints.includes("/responses");
 	const hasCompletions = endpoints.includes("/chat/completions");
+	const hasMessages = endpoints.includes("/v1/messages");
+	const id = model.id.toLowerCase();
+	const family = model.capabilities.family.toLowerCase();
 
-	// If ONLY responses (no completions), use responses API
-	if (hasResponses && !hasCompletions) return "openai-responses";
+	// Copilot Claude models are routed through Anthropic Messages in recent pi versions.
+	if (hasMessages && (id.includes("claude") || family.includes("claude"))) return "anthropic-messages";
 
-	// Default to completions (most compatible)
+	// If ONLY Anthropic Messages is exposed, use it.
+	if (hasMessages && !hasCompletions && !hasResponses) return "anthropic-messages";
+
+	// If ONLY responses (no completions/messages), use responses API.
+	if (hasResponses && !hasCompletions && !hasMessages) return "openai-responses";
+
+	// If both messages + completions are exposed, prefer completions for non-Claude models.
+	if (hasMessages && hasCompletions) return "openai-completions";
+
+	// Default to completions (most compatible).
 	return "openai-completions";
 }
 

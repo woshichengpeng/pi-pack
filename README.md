@@ -16,7 +16,7 @@ Then run:
 /install
 ```
 
-This symlinks everything in `pack/` to `~/.pi/agent/`, making them globally available across all projects.
+This symlinks everything in `pack/` to `~/.pi/agent/`, installs dependencies when needed, and auto-runs a runtime reload so new resources are immediately available.
 
 ## Structure
 
