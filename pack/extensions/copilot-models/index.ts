@@ -10,6 +10,9 @@
 
 import type { Api, Model } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 // --- Types for the Copilot /models API response ---
 
@@ -198,10 +201,86 @@ function modelToConfig(model: Model<Api>): ProviderModelConfig {
 	return config;
 }
 
+// --- Model cache for cross-restart persistence ---
+
+const CACHE_PATH = join(homedir(), ".pi", "copilot-models-cache.json");
+
+/** Headers that must not be persisted to disk */
+const SENSITIVE_HEADER_KEYS = new Set([
+	"authorization",
+	"x-api-key",
+	"cookie",
+	"set-cookie",
+]);
+
+/** Strip sensitive headers before caching */
+function sanitizeHeaders(headers?: Record<string, string>): Record<string, string> | undefined {
+	if (!headers) return undefined;
+	const clean: Record<string, string> = {};
+	for (const [k, v] of Object.entries(headers)) {
+		if (!SENSITIVE_HEADER_KEYS.has(k.toLowerCase())) {
+			clean[k] = v;
+		}
+	}
+	return Object.keys(clean).length > 0 ? clean : undefined;
+}
+
+interface CachedProviderData {
+	baseUrl: string;
+	apiKey: string;
+	models: ProviderModelConfig[];
+	timestamp: number;
+}
+
+function readModelCache(): CachedProviderData | null {
+	try {
+		if (!existsSync(CACHE_PATH)) return null;
+		const data = JSON.parse(readFileSync(CACHE_PATH, "utf-8")) as CachedProviderData;
+		if (!data.baseUrl || !Array.isArray(data.models) || data.models.length === 0) return null;
+		// Sanitize headers on read (old caches may contain sensitive values)
+		data.models = data.models.map((m) => ({ ...m, headers: sanitizeHeaders(m.headers) }));
+		return data;
+	} catch {
+		return null;
+	}
+}
+
+function writeModelCache(baseUrl: string, apiKey: string, models: ProviderModelConfig[]): void {
+	try {
+		const dir = join(homedir(), ".pi");
+		mkdirSync(dir, { recursive: true });
+		// Strip sensitive headers before persisting
+		const sanitized = models.map((m) => ({ ...m, headers: sanitizeHeaders(m.headers) }));
+		const data: CachedProviderData = { baseUrl, apiKey, models: sanitized, timestamp: Date.now() };
+		writeFileSync(CACHE_PATH, JSON.stringify(data, null, 2), { mode: 0o600 });
+		// Ensure permissions even if file already existed
+		chmodSync(CACHE_PATH, 0o600);
+	} catch {
+		// Silently ignore cache write errors
+	}
+}
+
 // --- Extension entry point ---
 
 export default function copilotModelsExtension(pi: ExtensionAPI): void {
 	let addedModelIds: string[] = [];
+
+	// --- Eager registration from cache (synchronous, runs before session restore) ---
+	// pi.registerProvider() queues for pendingProviderRegistrations which is drained
+	// in main.js BEFORE createAgentSession() restores the saved model.
+	// This ensures dynamically discovered models survive restarts.
+	const cached = readModelCache();
+	if (cached) {
+		try {
+			pi.registerProvider("github-copilot", {
+				baseUrl: cached.baseUrl,
+				apiKey: cached.apiKey,
+				models: cached.models,
+			});
+		} catch {
+			// Invalid/stale cache — ignore, will be refreshed on session_start
+		}
+	}
 
 	async function discoverAndRegister(
 		ctx: ExtensionContext,
@@ -241,6 +320,8 @@ export default function copilotModelsExtension(pi: ExtensionAPI): void {
 		const newCopilotModels = chatModels.filter((m) => !existingIds.has(m.id));
 
 		if (newCopilotModels.length === 0) {
+			// Still update cache with current model set (base models may have changed)
+			writeModelCache(baseUrl, "COPILOT_GITHUB_TOKEN", existingModels.map(modelToConfig));
 			return { added: [], skipped: false };
 		}
 
@@ -272,6 +353,9 @@ export default function copilotModelsExtension(pi: ExtensionAPI): void {
 		const afterModels = ctx.modelRegistry.getAll().filter((m) => m.provider === "github-copilot");
 		const afterIds = new Set(afterModels.map((m) => m.id));
 		const actuallyAdded = newConfigs.filter((c) => afterIds.has(c.id)).map((c) => c.id);
+
+		// Persist all copilot models to cache for next startup
+		writeModelCache(baseUrl, "COPILOT_GITHUB_TOKEN", afterModels.map(modelToConfig));
 
 		addedModelIds = actuallyAdded;
 		return { added: actuallyAdded, skipped: false };
