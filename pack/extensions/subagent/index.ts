@@ -454,6 +454,7 @@ async function runSingleAgent(
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	sessionId?: string,
 	enableSession: boolean = true,
+	modelOverride?: string,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -533,7 +534,8 @@ async function runSingleAgent(
 	}
 
 	const args: string[] = ["--mode", "json", "-p"];
-	if (agent.model) args.push("--model", agent.model);
+	const effectiveModel = modelOverride || agent.model;
+	if (effectiveModel) args.push("--model", effectiveModel);
 	if (agent.thinkingLevel) args.push("--thinking", agent.thinkingLevel);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
@@ -550,7 +552,7 @@ async function runSingleAgent(
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		model: agent.model,
+		model: effectiveModel,
 		step,
 	};
 
@@ -697,12 +699,14 @@ const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	model: Type.Optional(Type.String({ description: "Override the agent's default model (e.g. 'anthropic/claude-sonnet-4-20250514')" })),
 });
 
 const ChainItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	model: Type.Optional(Type.String({ description: "Override the agent's default model (e.g. 'anthropic/claude-sonnet-4-20250514')" })),
 });
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
@@ -713,6 +717,7 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 const SubagentParams = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
+	model: Type.Optional(Type.String({ description: "Override the agent's default model for single mode (e.g. 'anthropic/claude-sonnet-4-20250514')" })),
 	sessionId: Type.Optional(
 		Type.String({
 			description:
@@ -839,7 +844,7 @@ async function runForegroundExecution(
 			const result = await runSingleAgent(
 				cwd, agents, step.agent, taskWithContext, step.cwd, i + 1,
 				signal, chainUpdate, makeDetails("chain"),
-				undefined, false,
+				undefined, false, step.model,
 			);
 			results.push(result);
 
@@ -900,7 +905,7 @@ async function runForegroundExecution(
 					}
 				},
 				makeDetails("parallel"),
-				undefined, false,
+				undefined, false, t.model,
 			);
 			allResults[index] = result;
 			emitParallelUpdate();
@@ -922,7 +927,7 @@ async function runForegroundExecution(
 	if (params.agent && params.task) {
 		const result = await runSingleAgent(
 			cwd, agents, params.agent, params.task, params.cwd, undefined, signal, onUpdate, makeDetails("single"),
-			sessionId,
+			sessionId, true, params.model,
 		);
 		const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
 		if (isError) {
@@ -1136,6 +1141,7 @@ export default function (pi: ExtensionAPI) {
 			'To enable project-local agents in .pi/agents, set agentScope: "both" (or "project").',
 			"Set background: true to run in background and continue chatting.",
 			"To resume a previous conversation with a subagent, pass the sessionId from the previous result.",
+			"Use the model parameter to override an agent's default model on the fly.",
 		].join(" "),
 		parameters: SubagentParams,
 
@@ -1310,11 +1316,13 @@ export default function (pi: ExtensionAPI) {
 					// Clean up {previous} placeholder for display
 					const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
 					const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
+					const modelTag = step.model ? theme.fg("warning", ` [${step.model}]`) : "";
 					text +=
 						"\n  " +
 						theme.fg("muted", `${i + 1}.`) +
 						" " +
 						theme.fg("accent", step.agent) +
+						modelTag +
 						theme.fg("dim", ` ${preview}`);
 				}
 				if (args.chain.length > 3) text += `\n  ${theme.fg("muted", `... +${args.chain.length - 3} more`)}`;
@@ -1327,7 +1335,8 @@ export default function (pi: ExtensionAPI) {
 					theme.fg("muted", ` [${scope}]`) + bgTag;
 				for (const t of args.tasks.slice(0, 3)) {
 					const preview = t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task;
-					text += `\n  ${theme.fg("accent", t.agent)}${theme.fg("dim", ` ${preview}`)}`;
+					const modelTag = t.model ? theme.fg("warning", ` [${t.model}]`) : "";
+					text += `\n  ${theme.fg("accent", t.agent)}${modelTag}${theme.fg("dim", ` ${preview}`)}`;
 				}
 				if (args.tasks.length > 3) text += `\n  ${theme.fg("muted", `... +${args.tasks.length - 3} more`)}`;
 				return new Text(text, 0, 0);
@@ -1335,10 +1344,11 @@ export default function (pi: ExtensionAPI) {
 			const agentName = args.agent || "...";
 			const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
 			const resumeTag = args.sessionId ? theme.fg("accent", ` ↩ ${args.sessionId}`) : "";
+			const modelTag = args.model ? theme.fg("warning", ` [${args.model}]`) : "";
 			let text =
 				theme.fg("toolTitle", theme.bold("subagent ")) +
 				theme.fg("accent", agentName) +
-				theme.fg("muted", ` [${scope}]`) + bgTag + resumeTag;
+				theme.fg("muted", ` [${scope}]`) + bgTag + modelTag + resumeTag;
 			text += `\n  ${theme.fg("dim", preview)}`;
 			return new Text(text, 0, 0);
 		},

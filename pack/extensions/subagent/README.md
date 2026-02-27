@@ -153,7 +153,7 @@ This pack provides the sample agents under `pack/agents/` and installs them to `
 |-------|---------|-------|-------|
 | `scout` | Fast codebase recon | Claude Haiku 4.5 (Copilot) | read, grep, find, ls, bash |
 | `planner` | Implementation plans | Claude Sonnet 4.5 (Copilot) | read, grep, find, ls |
-| `reviewer` | Code review | GPT-5.2-Codex (Copilot) | read, grep, find, ls, bash |
+| `reviewer` | Code review | GPT-5.3-Codex (Copilot) | read, grep, find, ls, bash |
 | `worker` | General-purpose | Claude Sonnet 4.5 (Copilot) | (all default) |
 
 ## Workflow Prompts
